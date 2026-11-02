@@ -1,0 +1,30 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+backend/.venv/
+backend/app.db
+backend/app.db-journal
+backend/app.db-wal
+backend/app.db-shm
+
+# Node / build output
+frontend/node_modules/
+frontend/dist/
+npm-debug.log*
+
+# Agent workspace metadata
+.freebuff/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log

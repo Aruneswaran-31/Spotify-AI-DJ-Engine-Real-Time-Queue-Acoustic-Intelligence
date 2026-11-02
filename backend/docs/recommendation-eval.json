@@ -1,0 +1,135 @@
+{
+  "usersEvaluated": 5,
+  "heldOutPerUser": 5,
+  "meanPrecisionAt5": 0.72,
+  "hitRateAt5": 1.0,
+  "target": 0.6,
+  "meetsTarget": true,
+  "perUser": [
+    {
+      "userId": "u_462fcba01d2d",
+      "heldOutTrackIds": [
+        "t_b693e70ad5ce",
+        "t_291d61958a2a",
+        "t_6340eef5548b",
+        "t_fd1aa59ce853",
+        "t_001fcff05bb0"
+      ],
+      "precisionAt5": 0.8,
+      "heldOutRanks": {
+        "t_b693e70ad5ce": 4,
+        "t_291d61958a2a": null,
+        "t_6340eef5548b": 1,
+        "t_fd1aa59ce853": 3,
+        "t_001fcff05bb0": 2
+      },
+      "recommendationIds": [
+        "t_6340eef5548b",
+        "t_001fcff05bb0",
+        "t_fd1aa59ce853",
+        "t_b693e70ad5ce",
+        "t_f6b25fe1da62"
+      ]
+    },
+    {
+      "userId": "u_cf986c15116d",
+      "heldOutTrackIds": [
+        "t_9dc9e8ce8108",
+        "t_36fb21d011b8",
+        "t_4e7a0cef6107",
+        "t_fd1aa59ce853",
+        "t_06ed62f1ad4c"
+      ],
+      "precisionAt5": 0.8,
+      "heldOutRanks": {
+        "t_9dc9e8ce8108": 1,
+        "t_36fb21d011b8": 2,
+        "t_4e7a0cef6107": 5,
+        "t_fd1aa59ce853": null,
+        "t_06ed62f1ad4c": 3
+      },
+      "recommendationIds": [
+        "t_9dc9e8ce8108",
+        "t_36fb21d011b8",
+        "t_06ed62f1ad4c",
+        "t_174c9220cb21",
+        "t_4e7a0cef6107"
+      ]
+    },
+    {
+      "userId": "u_05faebde501c",
+      "heldOutTrackIds": [
+        "t_b693e70ad5ce",
+        "t_6340eef5548b",
+        "t_c9c883f9e8fc",
+        "t_f6b25fe1da62",
+        "t_001fcff05bb0"
+      ],
+      "precisionAt5": 0.8,
+      "heldOutRanks": {
+        "t_b693e70ad5ce": 1,
+        "t_6340eef5548b": 5,
+        "t_c9c883f9e8fc": 4,
+        "t_f6b25fe1da62": null,
+        "t_001fcff05bb0": 2
+      },
+      "recommendationIds": [
+        "t_b693e70ad5ce",
+        "t_001fcff05bb0",
+        "t_06ed62f1ad4c",
+        "t_c9c883f9e8fc",
+        "t_6340eef5548b"
+      ]
+    },
+    {
+      "userId": "u_8605b3c3144c",
+      "heldOutTrackIds": [
+        "t_6340eef5548b",
+        "t_291d61958a2a",
+        "t_9dc9e8ce8108",
+        "t_fd1aa59ce853",
+        "t_001fcff05bb0"
+      ],
+      "precisionAt5": 0.8,
+      "heldOutRanks": {
+        "t_6340eef5548b": 3,
+        "t_291d61958a2a": 5,
+        "t_9dc9e8ce8108": 2,
+        "t_fd1aa59ce853": 1,
+        "t_001fcff05bb0": null
+      },
+      "recommendationIds": [
+        "t_fd1aa59ce853",
+        "t_9dc9e8ce8108",
+        "t_6340eef5548b",
+        "t_820c83a739d8",
+        "t_291d61958a2a"
+      ]
+    },
+    {
+      "userId": "u_22d5f315c62d",
+      "heldOutTrackIds": [
+        "t_b693e70ad5ce",
+        "t_6340eef5548b",
+        "t_820c83a739d8",
+        "t_f6b25fe1da62",
+        "t_001fcff05bb0"
+      ],
+      "precisionAt5": 0.4,
+      "heldOutRanks": {
+        "t_b693e70ad5ce": null,
+        "t_6340eef5548b": 4,
+        "t_820c83a739d8": null,
+        "t_f6b25fe1da62": null,
+        "t_001fcff05bb0": 1
+      },
+      "recommendationIds": [
+        "t_001fcff05bb0",
+        "t_06ed62f1ad4c",
+        "t_c9c883f9e8fc",
+        "t_6340eef5548b",
+        "t_fd1aa59ce853"
+      ]
+    }
+  ]
+}

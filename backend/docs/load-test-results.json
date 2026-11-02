@@ -1,0 +1,21 @@
+{
+  "clients": 50,
+  "rest": {
+    "samples": 30,
+    "p50Ms": 16.7,
+    "p95Ms": 21.67
+  },
+  "queueSync": {
+    "consistentAcrossClients": true,
+    "driftMs": 22.65,
+    "fanoutCompletionMs": 75.23,
+    "fanoutDeliveredTo": 50,
+    "concurrentVoteStormMs": 1208.04
+  },
+  "lateJoinStateMs": 49.74,
+  "aiSegue": {
+    "samples": 5,
+    "p50Ms": 38.43,
+    "p95Ms": 42.77
+  }
+}

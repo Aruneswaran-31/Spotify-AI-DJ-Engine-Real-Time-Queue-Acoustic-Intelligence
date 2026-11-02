@@ -1,0 +1,25 @@
+{
+  "samples": 20,
+  "correct": 20,
+  "accuracy": 1.0,
+  "target": 0.85,
+  "meetsTarget": true,
+  "perBucket": {
+    "positive": {
+      "support": 8,
+      "precision": 1.0,
+      "recall": 1.0
+    },
+    "neutral": {
+      "support": 5,
+      "precision": 1.0,
+      "recall": 1.0
+    },
+    "negative": {
+      "support": 7,
+      "precision": 1.0,
+      "recall": 1.0
+    }
+  },
+  "errors": []
+}

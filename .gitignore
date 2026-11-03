@@ -22,6 +22,11 @@ npm-debug.log*
 # Agent workspace metadata
 .freebuff/
 
+# Throwaway databases created by scripts/cluster_test.py and the seed script
+backend/cluster*.db
+backend/cluster*.db-wal
+backend/cluster*.db-shm
+
 # Editors / OS
 .DS_Store
 Thumbs.db

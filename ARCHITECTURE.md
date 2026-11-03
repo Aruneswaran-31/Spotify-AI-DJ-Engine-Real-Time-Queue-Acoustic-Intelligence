@@ -16,7 +16,7 @@ flowchart TB
         ADMIN[Admin catalog + per-track Q&A]
     end
 
-    subgraph API["FastAPI application (single process)"]
+    subgraph API["FastAPI worker (1..N, identical)"]
         REST["REST API /api/v1<br/>auth · tracks · lounges · ai · analytics"]
         WS["WebSocket gateway /ws/lounges/{id}<br/>JWT handshake · event dispatch"]
         HUB["Room Hub (in memory)<br/>queue · votes · playback · soundclash · presence<br/>sentiment window · AI feed"]
@@ -242,13 +242,70 @@ on `WebSocket`). A production build would use a short-lived, single-use ticket i
 
 ---
 
-## 7. Scaling path
+## 7. Running on more than one worker
 
-The architecture does not hard-code a single room: `Hub` keys everything by `lounge_id`, and no
-module assumes one socket. To run multiple API instances:
+`BUS_BACKEND=memory` (the default) keeps all live state in one process. Setting
+`BUS_BACKEND=sqlite` or `redis` turns the same build into a multi-worker deployment with no
+session affinity, which is what `app/cluster.py` implements.
 
-1. move room mutation events to Redis pub/sub (or NATS) and make the hub a per-room leader;
-2. use sticky sessions or a ticket-based gateway for socket affinity;
-3. move the batched writer onto a queue (or Postgres `COPY`/batch inserts);
-4. swap SQLite for PostgreSQL and add a read replica for analytics;
-5. keep the AI engine stateless and cache track profiles by version.
+### One writer per room
+
+A room's ordering, vote tallies, Soundclash, sentiment window and playback clock are still plain
+Python objects guarded by one `asyncio.Lock` — but the room exists on exactly **one** worker at a
+time. That worker holds a lease (`room_lease`) with a 5 s TTL that it renews every ~1.6 s. A worker
+takes a room by winning an atomic `INSERT OR IGNORE` + conditional `UPDATE` inside `BEGIN IMMEDIATE`,
+so two workers racing for the same room cannot both win.
+
+Because there is a single writer, none of the mutation logic needed to become distributed: reorder,
+vote, segue selection and AI announcements are unchanged. The distributed part is only transport
+and ownership.
+
+### Fan-out over the bus
+
+`Room.broadcast` publishes one envelope on `room:<loungeId>`; the bus hands that envelope to every
+worker including the publisher, and each worker writes it to the sockets it physically holds. Two
+clients in one room therefore see the same event stream even when they are attached to different
+workers. Socket failures are reaped by the receiving worker rather than the publisher.
+
+| Backend | Scope | Cost per message |
+| --- | --- | --- |
+| `memory` | one process | direct call, no serialisation |
+| `sqlite` | several workers on one host | one row append + a 12 ms poll |
+| `redis` | several hosts | one `PUBLISH` + a blocking read |
+
+### Edge workers forward work
+
+A worker that does not own the room is an *edge*: it terminates the socket, authenticates, then
+forwards each event to the owner (`remote.cmd`) and writes back whatever the owner broadcasts or
+sends directly to that connection. The owner keeps a stand-in `Connection` whose `send_json`
+publishes a targeted `direct` frame, so role checks, participant lists, host handover and player
+control all keep operating on one authoritative view.
+
+Lounge-scoped HTTP is handled the same way one layer up: `ClusterProxyMiddleware` routes any
+`/api/v1/lounges/{id}/...` request to the owning worker, which re-executes it in-process through an
+ASGI transport. Exceptions are re-raised by their original type across the boundary, so a listener
+who tries to promote a track still gets `forbidden` rather than a generic server error.
+
+### Presence and failure
+
+Edge workers heartbeat their socket list; the owner reaps sockets from a worker that has been silent
+for 15 s. If an owner dies outright, its lease lapses and the next worker holding sockets for that
+room claims it, rebuilds the room from the database and pushes a fresh `lounge.state` to its clients
+— measured at **5.8 s** end to end after a `taskkill` of the owner.
+
+### What this does and does not buy you
+
+* Any worker can accept any client; horizontal scaling is a load balancer in front of identical
+  processes, with no sticky-session rule.
+* `sqlite` keeps the deployment single-host (the topology the app's own persistence implies).
+  Multi-host needs `BUS_BACKEND=redis` plus a PostgreSQL `DATABASE_URL`; the Redis adapter is
+  code-complete but was not exercised here because no Redis instance was available.
+* State lost with a dead owner is bounded by the 1.5 s batched flush, not by the bus.
+* Baseline memory/CPU per room is unchanged: one Python object graph, on one worker.
+
+### Further work, still open
+
+1. move the batched writer onto a queue (or Postgres `COPY`/batch inserts) at high room counts;
+2. add a read replica for analytics queries;
+3. shard rooms across workers by hash instead of first-touch, to balance owner load;
+4. cache track profiles by catalog version so the AI engine stops re-reading them per room.

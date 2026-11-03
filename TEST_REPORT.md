@@ -47,7 +47,7 @@ backend/.venv/Scripts/python.exe backend/scripts/eval_sentiment.py
 backend/.venv/Scripts/python.exe backend/scripts/eval_recommend.py
 ```
 
-## Automated suite — 86 tests, all passing
+## Automated suite — 97 tests, all passing
 
 ```
 backend/tests/test_acoustic.py        31 passed   acoustic rule engine
@@ -55,6 +55,7 @@ backend/tests/test_sentiment.py       25 passed   scoring, aggregation, moderati
 backend/tests/test_queue_state.py     10 passed   in-memory room state machine
 backend/tests/test_rbac.py            10 passed   role enforcement
 backend/tests/test_api_flow.py        10 passed   end-to-end REST + WebSocket flows
+backend/tests/test_cluster.py         11 passed   bus, lease, RPC, socket routing
 ```
 
 Total wall time: 58 s (the suite spins a real ASGI app and drives WebSockets per test).
@@ -82,6 +83,13 @@ change ownership; admin overrides; role assignment is host-only; unauthenticated
 vote → chat → soundclash open/submit/vote/resolve → AI segue → analytics, plus token refresh, 401 on
 expired tokens, capacity rejection (409), locked-room rejection (403), and WebSocket auth failure
 (close 4401).
+
+**`test_cluster.py` (11)** — two independent bus and lease instances against one temporary SQLite
+file, which is the arrangement two uvicorn workers use on a single host: in-process delivery, a
+message published on one worker reaching the other, no replay of history predating a worker's start,
+single-owner elections under a race, handover after a lease expires, explicit release, RPC round-trip
+with result and with a reconstructed `PermissionError`, RPC timeout when nobody answers, and routing
+of room events vs. direct frames to the sockets a worker actually holds.
 
 ## Live load test — 50 concurrent clients
 
@@ -174,13 +182,51 @@ Exercised manually in Chromium against the live server while building the client
   script; "ask the AI DJ" returned a cited timeline answer.
 - Analytics page reconciled with the session (chat counts, battle counts, sentiment timeline).
 
+## Multi-worker cluster — 2 live workers, 13/13 checks
+
+Method: two real `uvicorn` processes (ports 8142/8143) sharing one SQLite database and one
+`BUS_BACKEND=sqlite` bus, each targeted directly so a client can be pinned to a given worker. The
+probe (`backend/scripts/cluster_test.py`) opens sockets on both, drives commands through the
+non-owning worker, and compares what each side sees. Raw output:
+[`backend/docs/cluster-test-results.json`](backend/docs/cluster-test-results.json).
+
+| Check | Result |
+| --- | --- |
+| Two distinct workers serving | pass |
+| Presence spans workers (3 participants, 2 workers) | pass |
+| Command sent to the edge worker executes | pass |
+| Event produced on the owner reaches the other worker | **32.3 ms** |
+| Both workers report the identical queue order | pass |
+| REST read on the non-owning worker is forwarded | **50.8 ms** |
+| Forwarded REST returns the same state as the owner | pass |
+| Chat written through the edge worker persists + broadcasts | **68.0 ms** |
+| Permission error keeps its type across workers (`forbidden`) | pass |
+| Late joiner on the edge worker gets full state | **31.5 ms** |
+| Late joiner sees the live queue | pass |
+| Lounge ends cleanly, lease released | pass |
+| **Failover**: owner `taskkill`ed, survivor adopts the room | **5.81 s**, voting works after |
+
+Two things were fixed because the measurement exposed them:
+
+- the bus reopened a SQLite connection per message, so a cross-worker command cost ~99 ms of pure
+  connection setup; reusing one connection per worker (and one per lease store) cut the round-trip
+  to 32 ms and REST forwarding from 102 ms to 51 ms;
+- remote failures were flattened to a generic `RpcError`, so a listener's forbidden promote would
+  have surfaced on the edge worker as a server error; the original exception class is now rebuilt
+  from the reply.
+
+The single-worker load test above still stands unchanged: with `BUS_BACKEND=memory` there is no
+serialisation and no poll, so single-process latency is exactly what it was before.
+
 ## Limitations
 
-1. **Single-process state.** Rooms live in an in-memory hub, so the measured numbers are for one
-   uvicorn worker. Running multiple workers would split rooms. Horizontal scaling needs a shared
-   broker (the hub interface is the seam).
+1. **Multi-worker is verified on one host only.** The SQLite bus was measured with two live workers;
+   the Redis backend for multi-host is code-complete but unexercised here (no Redis available).
+   Owner death costs up to the 1.5 s flush interval of live state, and adoption takes up to the 5 s
+   lease TTL.
 2. **SQLite writes.** Persistence is synchronous inside request handlers. Under sustained concurrent
-   writes this becomes the bottleneck; Postgres + async SQLAlchemy is the migration path.
+   writes this becomes the bottleneck; the schema compiles for PostgreSQL and `DATABASE_URL` switches
+   dialects, but no Postgres server was available to benchmark against.
 3. **Loopback latency.** All transport figures exclude real network conditions and browser rendering
    time.
 4. **Deterministic generator, not an LLM.** The "AI DJ" is retrieval + rules + templated language

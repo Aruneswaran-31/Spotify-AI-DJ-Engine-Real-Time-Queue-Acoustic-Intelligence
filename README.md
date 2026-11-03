@@ -39,7 +39,7 @@ Sentiment-Aware Audio Engine"** — Track A (full-stack), Python implementation 
 | --- | --- |
 | Frontend | React 18 + Vite, plain CSS design system |
 | Backend | FastAPI (Python 3.11+; developed on 3.14) |
-| Real-time | Native WebSockets + in-memory per-room hub |
+| Real-time | Native WebSockets; one owning worker per room, bus fan-out across workers |
 | Database | SQLite by default (zero setup); SQLAlchemy models also target PostgreSQL via `DATABASE_URL` |
 | ORM | SQLAlchemy 2.1 |
 | Auth | PyJWT + bcrypt, custom RBAC dependencies |
@@ -101,6 +101,36 @@ Copy `.env.example` to `.env` and set at least `JWT_SECRET` for sessions that su
 Everything works without an LLM key; set `OPENAI_API_KEY` to let the AI DJ phrase banter with a
 hosted OpenAI-compatible model (grounding validation still applies).
 
+### Scaling across workers
+
+By default one process owns all live room state (`BUS_BACKEND=memory`) — the simplest thing that
+works, and what you want for local development. To run several workers behind a load balancer, set
+the same `JWT_SECRET` everywhere, choose a shared bus, and point every worker at the same database:
+
+```bash
+# two workers, one host, no extra infrastructure (uses SQLite for the bus)
+export JWT_SECRET=$(python -c "import secrets;print(secrets.token_urlsafe(48))")
+export BUS_BACKEND=sqlite BUS_SQLITE_PATH=/var/lib/aidj/cluster.db
+cd backend && python -m uvicorn app.main:app --port 8001 &
+cd backend && python -m uvicorn app.main:app --port 8002 &
+
+# several hosts
+# export BUS_BACKEND=redis REDIS_URL=redis://cache:6379/0   (pip install redis)
+```
+
+Get a room's sockets to *any* worker: exactly one worker owns each room, every other worker holds
+sockets and forwards commands to the owner, and broadcasts are relayed over the bus. Clients cannot
+tell which worker they landed on, and no session affinity is needed at the load balancer. If the
+owner dies its lease lapses and a surviving worker adopts the room — see
+[Architecture → running on more than one worker](ARCHITECTURE.md#running-on-more-than-one-worker).
+
+Verify it yourself with two workers:
+
+```bash
+backend/.venv/Scripts/python backend/scripts/cluster_test.py \
+  --a http://127.0.0.1:8001 --b http://127.0.0.1:8002
+```
+
 ---
 
 ## Demo accounts (created by the seed script)
@@ -148,14 +178,18 @@ Evidence artifacts produced by the scripts live in [`backend/docs/`](backend/doc
 - `load-test-results.json` — multi-client load test
 - `sentiment-eval.json` — labelled sentiment accuracy
 - `recommendation-eval.json` — Precision@5 holdout evaluation
+- `cluster-test-results.json` — two-worker fan-out, forwarding and shared-order probe
 
 ---
 
 ## Testing and measurement
 
 ```bash
-# 86 automated tests (queue, acoustic rules, sentiment, RBAC, end-to-end flows)
+# 97 automated tests (queue, acoustic rules, sentiment, RBAC, end-to-end flows, cluster)
 backend/.venv/Scripts/python -m pytest backend/tests -q
+
+# Two-worker cluster probe: fan-out, command forwarding, shared order, failover
+backend/.venv/Scripts/python backend/scripts/cluster_test.py --a http://127.0.0.1:8001 --b http://127.0.0.1:8002
 
 # Offline evaluations
 backend/.venv/Scripts/python backend/scripts/eval_sentiment.py

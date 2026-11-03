@@ -39,6 +39,19 @@ class Settings:
 
     DATABASE_URL: str = os.getenv("DATABASE_URL", f"sqlite:///{(BASE_DIR / 'app.db').as_posix()}")
     DB_ECHO: bool = os.getenv("DB_ECHO", "0") == "1"
+    DB_POOL_SIZE: int = int(os.getenv("DB_POOL_SIZE", "10"))
+    DB_MAX_OVERFLOW: int = int(os.getenv("DB_MAX_OVERFLOW", "20"))
+
+    # Cross-process coordination (see app/cluster.py):
+    #   memory - one process (default; no coordination overhead)
+    #   sqlite - several uvicorn workers on one host, sharing BUS_SQLITE_PATH
+    #   redis  - several hosts sharing a Redis instance
+    BUS_BACKEND: str = os.getenv("BUS_BACKEND", "memory").strip().lower()
+    BUS_SQLITE_PATH: str = os.getenv(
+        "BUS_SQLITE_PATH", f"{(BASE_DIR / 'cluster.db').as_posix()}"
+    )
+    BUS_POLL_MS: int = int(os.getenv("BUS_POLL_MS", "12"))
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 
     # A generated fallback keeps local dev working; deployments must set JWT_SECRET.
     JWT_SECRET: str = os.getenv("JWT_SECRET") or secrets.token_urlsafe(48)

@@ -14,16 +14,26 @@ class Base(DeclarativeBase):
     pass
 
 
-connect_args = {"check_same_thread": False} if settings.DATABASE_URL.startswith("sqlite") else {}
+IS_SQLITE = settings.DATABASE_URL.startswith("sqlite")
+
+connect_args = {"check_same_thread": False} if IS_SQLITE else {}
+# Server databases need a real pool: every worker process holds its own connections.
+pool_args = (
+    {}
+    if IS_SQLITE
+    else {"pool_size": settings.DB_POOL_SIZE, "max_overflow": settings.DB_MAX_OVERFLOW}
+)
 engine = create_engine(
     settings.DATABASE_URL,
     echo=settings.DB_ECHO,
     future=True,
     pool_pre_ping=True,
+    pool_recycle=1800,
     connect_args=connect_args,
+    **pool_args,
 )
 
-if settings.DATABASE_URL.startswith("sqlite"):
+if IS_SQLITE:
 
     @event.listens_for(engine, "connect")
     def _sqlite_pragmas(dbapi_connection, _record):  # pragma: no cover - driver hook

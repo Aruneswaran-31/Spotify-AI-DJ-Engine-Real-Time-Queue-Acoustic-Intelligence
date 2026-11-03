@@ -9,6 +9,7 @@ Every event uses the shared envelope:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -18,10 +19,11 @@ from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconn
 from sqlalchemy import select
 
 from .catalog import catalog
+from .cluster import RpcError, RpcTimeout, cluster
 from .db import SessionLocal
 from .deps import ensure_participant, get_room
 from .models import ChatMessage, Lounge, LoungeParticipant, User
-from .realtime import Connection, Room, now_ms
+from .realtime import Connection, Room, hub, now_ms
 from .security import sanitize_text, user_from_token
 from .services import rag
 
@@ -36,6 +38,61 @@ CLOSE_CAPACITY = 4409
 
 def _can_manage(conn: Connection, room: Room) -> bool:
     return conn.role in ("admin", "co_dj") or conn.user_id == room.host_user_id
+
+
+def _admit(db, lounge: Lounge, user: User, room: Room) -> dict | None:
+    """Capacity / lock / status gate shared by the owning and edge code paths."""
+    if lounge.status == "ended":
+        return {"code": CLOSE_GONE, "reason": "That lounge has ended"}
+    already_present = user.id in room.participant_ids()
+    if not already_present and len(room.participant_ids()) >= lounge.max_participants:
+        return {"code": CLOSE_CAPACITY, "reason": "Lounge is at capacity"}
+    if lounge.locked and not already_present:
+        return {"code": CLOSE_FORBIDDEN, "reason": "That lounge is locked by the host"}
+    ensure_participant(db, lounge, user)
+    return None
+
+
+def _admit_remote(conn: Connection, room: Room) -> dict | None:
+    """Owner-side admission for a socket that terminated on another worker."""
+    with SessionLocal() as db:
+        lounge = db.get(Lounge, room.lounge_id)
+        user = db.get(User, conn.user_id)
+        if lounge is None or user is None:
+            return {"code": CLOSE_GONE, "reason": "Lounge not found"}
+        return _admit(db, lounge, user, room)
+
+
+def _chat_history(db, lounge_id: str, limit: int = 40) -> list[dict]:
+    history = db.scalars(
+        select(ChatMessage)
+        .where(ChatMessage.lounge_id == lounge_id)
+        .order_by(ChatMessage.created_at.desc())
+        .limit(limit)
+    ).all()
+    history = list(reversed(history))
+    speaker_ids = {message.user_id for message in history if message.user_id}
+    speakers = (
+        {row.id: row.display_name for row in db.scalars(select(User).where(User.id.in_(speaker_ids))).all()}
+        if speaker_ids
+        else {}
+    )
+    return [
+        {
+            "messageId": message.id,
+            "userId": message.user_id,
+            "displayName": speakers.get(message.user_id)
+            or ("AI DJ" if message.msg_type != "chat" else "Guest"),
+            "body": message.body,
+            "msgType": message.msg_type,
+            "sentimentScore": message.sentiment_score,
+            "sentimentBucket": message.sentiment_bucket,
+            "tsSeconds": message.ts_seconds,
+            "createdAt": int(message.created_at.timestamp() * 1000) if message.created_at else 0,
+            "reactions": message.reactions or {},
+        }
+        for message in history
+    ]
 
 
 def _envelope(event: str, lounge_id: str, payload: dict) -> dict:
@@ -67,47 +124,27 @@ async def lounge_websocket(
             await websocket.close(code=CLOSE_GONE)
             return
 
-        room = get_room(db, lounge)
-        already_present = user.id in room.participant_ids()
-        if not already_present and len(room.participant_ids()) >= lounge.max_participants:
-            await websocket.close(code=CLOSE_CAPACITY)
-            return
-        if lounge.locked and not already_present:
-            await websocket.close(code=CLOSE_FORBIDDEN)
-            return
-
-        ensure_participant(db, lounge, user)
         user_id, display_name, role = user.id, user.display_name, user.role
-        history = db.scalars(
-            select(ChatMessage)
-            .where(ChatMessage.lounge_id == lounge_id)
-            .order_by(ChatMessage.created_at.desc())
-            .limit(40)
-        ).all()
-        history = list(reversed(history))
-        speaker_ids = {message.user_id for message in history if message.user_id}
-        speakers = (
-            {row.id: row.display_name for row in db.scalars(select(User).where(User.id.in_(speaker_ids))).all()}
-            if speaker_ids
-            else {}
-        )
-        chat_history = [
-            {
-                "messageId": message.id,
-                "userId": message.user_id,
-                "displayName": speakers.get(message.user_id)
-                or ("AI DJ" if message.msg_type != "chat" else "Guest"),
-                "body": message.body,
-                "msgType": message.msg_type,
-                "sentimentScore": message.sentiment_score,
-                "sentimentBucket": message.sentiment_bucket,
-                "tsSeconds": message.ts_seconds,
-                "createdAt": int(message.created_at.timestamp() * 1000) if message.created_at else 0,
-                "reactions": message.reactions or {},
-            }
-            for message in history
-        ]
+        chat_history = _chat_history(db, lounge_id)
         catalog.refresh(db)
+
+    # One worker owns a room's live state; if it is not this one, act as an edge that
+    # forwards commands and relays whatever the owner broadcasts.
+    if not await cluster.claim(lounge_id):
+        await _edge_session(websocket, lounge_id, user_id, display_name, role, chat_history)
+        return
+
+    with SessionLocal() as db:
+        lounge = db.get(Lounge, lounge_id)
+        user = db.get(User, user_id)
+        if lounge is None or user is None:
+            await websocket.close(code=CLOSE_GONE)
+            return
+        room = get_room(db, lounge)
+        verdict = _admit(db, lounge, user, room)
+    if verdict:
+        await websocket.close(code=verdict["code"])
+        return
 
     await websocket.accept()
     conn = Connection(
@@ -116,7 +153,9 @@ async def lounge_websocket(
         user_id=user_id,
         display_name=display_name,
         role=role,
+        lounge_id=lounge_id,
     )
+    hub.register_local(conn)
     await room.join(conn)
 
     if room.frozen and conn.user_id == room.host_user_id:
@@ -159,6 +198,7 @@ async def lounge_websocket(
     except WebSocketDisconnect:
         pass
     finally:
+        hub.unregister_local(conn.id)
         await room.leave(conn)
         try:
             with SessionLocal() as db:
@@ -173,6 +213,128 @@ async def lounge_websocket(
                     db.commit()
         except Exception:  # noqa: BLE001
             logger.exception("participant presence persist failed")
+
+
+async def _edge_session(
+    websocket: WebSocket,
+    lounge_id: str,
+    user_id: str,
+    display_name: str,
+    role: str,
+    chat_history: list[dict],
+) -> None:
+    """Serve a socket whose room is owned by another worker.
+
+    The owner keeps the authoritative state and runs the real handlers; this process
+    authenticates, relays commands to the owner and writes back what it broadcasts.
+    The client cannot tell which worker it landed on.
+    """
+    channel = cluster.room_channel(lounge_id)
+    await websocket.accept()
+    conn = Connection(
+        id=f"sock_{uuid.uuid4().hex[:10]}",
+        ws=websocket,
+        user_id=user_id,
+        display_name=display_name,
+        role=role,
+        lounge_id=lounge_id,
+    )
+    hub.register_local(conn)
+    heartbeat: asyncio.Task | None = None
+
+    async def keepalive() -> None:
+        while True:
+            await asyncio.sleep(4)
+            await cluster.bus.publish(channel, "remote.presence", {})
+
+    try:
+        joined = await cluster.rpc.request(channel, "remote.join", conn.descriptor())
+        if not joined.get("admitted"):
+            await websocket.close(code=int(joined.get("code", CLOSE_GONE)))
+            return
+        snapshot = joined.get("snapshot") or {}
+        await websocket.send_json(
+            _envelope(
+                "lounge.state",
+                lounge_id,
+                {
+                    **snapshot,
+                    "you": {"userId": user_id, "displayName": display_name, "role": role},
+                    "chatHistory": chat_history,
+                    "canManage": role in ("admin", "co_dj")
+                    or user_id == (snapshot.get("lounge") or {}).get("hostUserId"),
+                },
+            )
+        )
+        await cluster.bus.publish(channel, "remote.presence", {})
+        heartbeat = asyncio.create_task(keepalive())
+
+        while True:
+            data = await websocket.receive_json()
+            if not isinstance(data, dict):
+                continue
+            event = str(data.get("event", ""))
+            payload = data.get("payload") or {}
+            try:
+                await cluster.rpc.request(
+                    channel,
+                    "remote.cmd",
+                    {"connId": conn.id, "conn": conn.descriptor(), "event": event, "payload": payload},
+                )
+            except PermissionError as exc:
+                await _edge_error(websocket, conn, str(exc), "forbidden")
+            except (ValueError, KeyError) as exc:
+                await _edge_error(websocket, conn, str(exc) or "Invalid request", "bad_request")
+            except (RpcTimeout, RpcError) as exc:
+                logger.warning("forwarded event %s failed: %s", event, exc)
+                await _edge_error(websocket, conn, "The room's DJ worker did not respond", "server_error")
+            except WebSocketDisconnect:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("edge relay failed: %s", event)
+                await _edge_error(websocket, conn, "Something went wrong handling that event", "server_error")
+    except WebSocketDisconnect:
+        pass
+    except RpcTimeout:
+        logger.warning("could not join %s: owner unavailable", lounge_id)
+        try:
+            await websocket.close(code=1013)
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
+        hub.unregister_local(conn.id)
+        try:
+            await cluster.bus.publish(channel, "remote.leave", {"connectionId": conn.id})
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to announce departure for %s", conn.id)
+        _touch_participant(lounge_id, user_id)
+
+
+async def _edge_error(websocket: WebSocket, conn: Connection, message: str, code: str) -> None:
+    try:
+        await websocket.send_json(
+            _envelope("lounge.error", conn.lounge_id, {"message": message, "code": code})
+        )
+    except Exception:  # noqa: BLE001 - socket already gone
+        return
+
+
+def _touch_participant(lounge_id: str, user_id: str) -> None:
+    try:
+        with SessionLocal() as db:
+            row = db.scalars(
+                select(LoungeParticipant).where(
+                    LoungeParticipant.lounge_id == lounge_id,
+                    LoungeParticipant.user_id == user_id,
+                )
+            ).first()
+            if row is not None:
+                row.last_seen_at = datetime.now(timezone.utc)
+                db.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("participant presence persist failed")
 
 
 async def _dispatch(conn: Connection, room: Room, event: str, payload: dict) -> None:
@@ -389,12 +551,18 @@ async def _ask(conn: Connection, room: Room, payload: dict) -> None:
         )
 
 
+# The owner of a room runs these for work forwarded from edge workers.
+hub.dispatcher = _dispatch
+hub.admitter = _admit_remote
+
+
 @router.get("/health/ws")
 def ws_health() -> dict:
-    from .realtime import hub
-
     return {
         "status": "ok",
-        "rooms": len(hub.rooms),
-        "connections": sum(len(room.connections) for room in hub.rooms.values()),
+        "worker": cluster.process_id,
+        "bus": cluster.backend,
+        "roomsOwned": len(hub.rooms),
+        "connections": hub.all_connections(),
+        "clusterEnabled": cluster.enabled,
     }

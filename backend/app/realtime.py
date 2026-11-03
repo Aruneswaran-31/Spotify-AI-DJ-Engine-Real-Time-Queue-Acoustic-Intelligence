@@ -25,6 +25,7 @@ from fastapi import WebSocket
 from sqlalchemy import select
 
 from .catalog import catalog
+from .cluster import CLUSTER_CHANNEL, RpcError, RpcTimeout, cluster
 from .config import settings
 from .db import SessionLocal
 from .models import (
@@ -59,12 +60,44 @@ def now_ms() -> int:
 
 
 @dataclass
+class BusSocket:
+    """Stands in for a real WebSocket when the client is attached to another worker.
+
+    Anything the room sends to this connection is published on the room channel and
+    handed to the owning edge process, which writes it to the actual socket.
+    """
+
+    channel: str
+    target_process: str
+    connection_id: str
+
+    async def send_json(self, message: dict) -> None:
+        await cluster.bus.publish(
+            self.channel,
+            "direct",
+            {
+                "target": self.target_process,
+                "connectionId": self.connection_id,
+                "message": message,
+            },
+        )
+
+
+@dataclass
 class Connection:
     id: str
     ws: WebSocket
     user_id: str
     display_name: str
     role: str
+    lounge_id: str = ""
+    # Set when the socket lives on a different worker; this process only holds a
+    # stand-in so the room's participant set and role checks stay authoritative.
+    remote_process: str | None = None
+
+    @property
+    def is_remote(self) -> bool:
+        return self.remote_process is not None
 
     def public(self) -> dict:
         return {
@@ -72,6 +105,15 @@ class Connection:
             "displayName": self.display_name,
             "role": self.role,
             "connectionId": self.id,
+        }
+
+    def descriptor(self) -> dict:
+        return {
+            "id": self.id,
+            "userId": self.user_id,
+            "displayName": self.display_name,
+            "role": self.role,
+            "loungeId": self.lounge_id,
         }
 
 
@@ -103,6 +145,9 @@ class Room:
     soundclash: dict | None = None
     soundclash_closer: asyncio.Task | None = None
     typing: dict[str, float] = field(default_factory=dict)
+    # Edge processes that currently hold sockets for this room, and when we last heard
+    # from them. A worker that disappears stops heartbeating and its sockets are reaped.
+    remote_seen: dict[str, float] = field(default_factory=dict)
     started_at: float = field(default_factory=time.time)
     peak_participants: int = 1
     chat_count: int = 0
@@ -237,18 +282,12 @@ class Room:
     # ------------------------------------------------------------------ broadcast
     async def broadcast(self, event: str, payload: dict) -> None:
         message = {"event": event, "loungeId": self.lounge_id, "payload": payload, "ts": now_ms()}
-        dead: list[str] = []
-        targets = list(self.connections.values())
-        if not targets:
+        if cluster.enabled:
+            # Every worker (this one included) delivers to its own sockets, so a room
+            # with clients on three workers still sees one consistent event stream.
+            await cluster.bus.publish(cluster.room_channel(self.lounge_id), "event", message)
             return
-        results = await asyncio.gather(
-            *(conn.ws.send_json(message) for conn in targets), return_exceptions=True
-        )
-        for conn, result in zip(targets, results):
-            if isinstance(result, Exception):
-                dead.append(conn.id)
-        for conn_id in dead:
-            self.connections.pop(conn_id, None)
+        await hub.deliver_event(self.lounge_id, message)
 
     async def send_error(self, conn: Connection, message: str, code: str = "bad_request") -> None:
         await conn.ws.send_json(
@@ -886,6 +925,10 @@ class Room:
     # ------------------------------------------------------------------ presence
     async def join(self, conn: Connection) -> None:
         self.connections[conn.id] = conn
+        if conn.remote_process:
+            self.remote_seen[conn.remote_process] = time.time()
+        else:
+            hub.register_local(conn)
         self.peak_participants = max(self.peak_participants, len(self.participant_ids()))
         await self.broadcast(
             "lounge.presence.update",
@@ -901,6 +944,8 @@ class Room:
     async def leave(self, conn: Connection) -> None:
         self.connections.pop(conn.id, None)
         self.typing.pop(conn.user_id, None)
+        if not conn.is_remote:
+            hub.unregister_local(conn.id)
 
         host_gone = conn.user_id == self.host_user_id and not any(
             c.user_id == self.host_user_id for c in self.connections.values()
@@ -1083,15 +1128,28 @@ class Hub:
     def __init__(self) -> None:
         self.rooms: dict[str, Room] = {}
         self._tasks: list[asyncio.Task] = []
+        # Sockets physically attached to this worker, across all rooms.
+        self._local: dict[str, Connection] = {}
+        # Participant counts for rooms owned elsewhere, refreshed by the owner.
+        self._peer_counts: dict[str, int] = {}
+        self._last_broadcast_counts: dict[str, int] = {}
+        # Set by the WebSocket gateway so forwarded events run the real handler and
+        # forwarded joins reuse the same admission checks.
+        self.dispatcher: Any = None
+        self.admitter: Any = None
+        self.http_executor: Any = None
 
     async def start(self) -> None:
         if self._tasks:
             return
+        await cluster.start(self._on_bus_message)
         self._tasks = [
             asyncio.create_task(self._playback_loop()),
             asyncio.create_task(self._sentiment_loop()),
             asyncio.create_task(self._flush_loop()),
         ]
+        if cluster.enabled:
+            self._tasks.append(asyncio.create_task(self._cluster_loop()))
 
     async def stop(self) -> None:
         for task in self._tasks:
@@ -1102,6 +1160,235 @@ class Hub:
                 room.flush()
             except Exception:  # noqa: BLE001
                 logger.exception("flush on shutdown failed")
+        await cluster.stop()
+
+    # ------------------------------------------------------------- cluster glue
+    def register_local(self, conn: Connection) -> None:
+        self._local[conn.id] = conn
+
+    def unregister_local(self, conn_id: str) -> None:
+        self._local.pop(conn_id, None)
+
+    def local_connections(self, lounge_id: str) -> list[Connection]:
+        return [conn for conn in self._local.values() if conn.lounge_id == lounge_id]
+
+    def participant_count(self, lounge_id: str) -> int:
+        room = self.rooms.get(lounge_id)
+        if room is not None and cluster.owns(lounge_id):
+            return len(room.participant_ids())
+        return self._peer_counts.get(lounge_id, 0)
+
+    def all_connections(self) -> int:
+        return len(self._local)
+
+    async def deliver_event(self, lounge_id: str, message: dict) -> None:
+        """Push a room event to the sockets this worker actually holds."""
+        targets = self.local_connections(lounge_id)
+        if not targets:
+            return
+        results = await asyncio.gather(
+            *(conn.ws.send_json(message) for conn in targets), return_exceptions=True
+        )
+        for conn, result in zip(targets, results):
+            if isinstance(result, Exception):
+                self.unregister_local(conn.id)
+                room = self.rooms.get(lounge_id)
+                if room is not None:
+                    room.connections.pop(conn.id, None)
+
+    async def deliver_direct(self, conn_id: str, message: dict) -> None:
+        conn = self._local.get(conn_id)
+        if conn is None:
+            return
+        try:
+            await conn.ws.send_json(message)
+        except Exception:  # noqa: BLE001
+            self.unregister_local(conn_id)
+
+    async def _on_bus_message(self, message: dict) -> None:
+        if cluster.rpc.handle(message):
+            return
+        channel = message.get("channel") or ""
+        if not channel.startswith("room:"):
+            return
+        lounge_id = channel[len("room:") :]
+        kind = message.get("kind")
+        payload = message.get("payload") or {}
+
+        if kind == "event":
+            await self.deliver_event(lounge_id, payload)
+            return
+        if kind == "direct":
+            if payload.get("target") == cluster.process_id:
+                await self.deliver_direct(payload.get("connectionId", ""), payload.get("message") or {})
+            return
+        if kind == "presence.count":
+            if payload.get("loungeId") == lounge_id:
+                self._peer_counts[lounge_id] = int(payload.get("count", 0))
+            return
+
+        # Everything below is a command addressed to the owning worker.
+        if not cluster.owns(lounge_id):
+            return
+        try:
+            if kind == "remote.join":
+                room = await self.ensure_room(lounge_id)
+                if room is None:
+                    raise ValueError("Lounge not found")
+                conn = self._remote_connection(room, payload, message.get("sender", ""))
+                verdict = await asyncio.to_thread(self.admitter, conn, room) if self.admitter else None
+                if verdict:
+                    await cluster.rpc.reply(channel, payload["reqId"], result={"admitted": False, **verdict})
+                    return
+                await room.join(conn)
+                await cluster.rpc.reply(
+                    channel,
+                    payload["reqId"],
+                    result={
+                        "admitted": True,
+                        "snapshot": room.snapshot(),
+                        "hostUserId": room.host_user_id,
+                    },
+                )
+            elif kind == "remote.leave":
+                room = self.rooms.get(lounge_id)
+                if room is not None:
+                    conn = room.connections.pop(payload.get("connectionId", ""), None)
+                    if conn is not None:
+                        await room.leave(conn)
+            elif kind == "remote.cmd":
+                room = await self.ensure_room(lounge_id)
+                if room is None:
+                    raise ValueError("Lounge not found")
+                conn = room.connections.get(payload.get("connId", ""))
+                if conn is None:
+                    descriptor = {**(payload.get("conn") or {}), "id": payload.get("connId")}
+                    conn = self._remote_connection(room, descriptor, message.get("sender", ""))
+                    room.connections[conn.id] = conn
+                if self.dispatcher is None:
+                    raise RuntimeError("No dispatcher attached")
+                await self.dispatcher(conn, room, payload.get("event", ""), payload.get("payload") or {})
+                await cluster.rpc.reply(channel, payload["reqId"], result={})
+            elif kind == "http.request":
+                if self.http_executor is None:
+                    raise RuntimeError("No HTTP executor attached")
+                result = await self.http_executor(payload)
+                await cluster.rpc.reply(channel, payload["reqId"], result=result)
+            elif kind == "remote.presence":
+                room = self.rooms.get(lounge_id)
+                if room is not None:
+                    room.remote_seen[message.get("sender", "")] = time.time()
+        except Exception as exc:  # noqa: BLE001 - surfaced to the caller over RPC
+            req_id = payload.get("reqId")
+            if req_id:
+                await cluster.rpc.reply(channel, req_id, error=exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+            else:
+                logger.exception("cluster command %s failed for %s", kind, lounge_id)
+
+    def _remote_connection(self, room: Room, payload: dict, sender: str) -> Connection:
+        conn_id = str(payload.get("id") or payload.get("connId") or f"rmt_{uuid.uuid4().hex[:10]}")
+        return Connection(
+            id=conn_id,
+            ws=BusSocket(  # type: ignore[arg-type]
+                channel=cluster.room_channel(room.lounge_id),
+                target_process=sender,
+                connection_id=conn_id,
+            ),
+            user_id=str(payload.get("userId", "")),
+            display_name=str(payload.get("displayName", "Guest")),
+            role=str(payload.get("role", "listener")),
+            lounge_id=room.lounge_id,
+            remote_process=sender,
+        )
+
+    async def ensure_room(self, lounge_id: str) -> Room | None:
+        """The authoritative room for a lounge we own, loading it if necessary."""
+        room = self.rooms.get(lounge_id)
+        if room is not None:
+            return room
+
+        def _load() -> Room | None:
+            with SessionLocal() as db:
+                lounge = db.get(Lounge, lounge_id)
+                if lounge is None:
+                    return None
+                catalog.refresh(db)
+                return self.load_room(lounge)
+
+        return await asyncio.to_thread(_load)
+
+    async def _cluster_loop(self) -> None:
+        """Advertise counts, reap dead workers' sockets and adopt orphaned rooms."""
+        while True:
+            try:
+                await asyncio.sleep(1.5)
+                for lounge_id in list(self.rooms):
+                    if not cluster.owns(lounge_id):
+                        continue
+                    room = self.rooms.get(lounge_id)
+                    if room is None:
+                        continue
+                    await self._reap_remote(room)
+                    count = len(room.participant_ids())
+                    if self._last_broadcast_counts.get(lounge_id) != count:
+                        self._last_broadcast_counts[lounge_id] = count
+                        await cluster.bus.publish(
+                            cluster.room_channel(lounge_id),
+                            "presence.count",
+                            {"loungeId": lounge_id, "count": count},
+                        )
+                # If we hold sockets for a room nobody owns any more, the worker that
+                # used to run it is gone. Take the lease and rebuild the room here.
+                held = {conn.lounge_id for conn in list(self._local.values()) if conn.lounge_id}
+                for lounge_id in held:
+                    if cluster.owns(lounge_id):
+                        continue
+                    if await cluster.claim(lounge_id):
+                        await self._adopt_room(lounge_id)
+            except asyncio.CancelledError:  # pragma: no cover
+                return
+            except Exception:  # noqa: BLE001
+                logger.exception("cluster loop error")
+
+    async def _adopt_room(self, lounge_id: str) -> None:
+        """Become the owner of a lobby whose previous worker disappeared."""
+        room = await self.ensure_room(lounge_id)
+        if room is None:
+            return
+        logger.warning("adopted room %s after its owner stopped responding", lounge_id)
+        for conn in self.local_connections(lounge_id):
+            if conn.id in room.connections:
+                continue
+            await room.join(conn)
+            await conn.ws.send_json(
+                {
+                    "event": "lounge.state",
+                    "loungeId": lounge_id,
+                    "payload": {
+                        **room.snapshot(),
+                        "you": {
+                            "userId": conn.user_id,
+                            "displayName": conn.display_name,
+                            "role": conn.role,
+                        },
+                        "canManage": conn.role in ("admin", "co_dj")
+                        or conn.user_id == room.host_user_id,
+                    },
+                    "ts": now_ms(),
+                }
+            )
+
+    async def _reap_remote(self, room: Room) -> None:
+        cutoff = time.time() - 15.0
+        stale = {proc for proc, seen in room.remote_seen.items() if seen < cutoff}
+        if not stale:
+            return
+        for conn in [c for c in room.connections.values() if c.remote_process in stale]:
+            logger.info("reaping socket %s from unresponsive worker %s", conn.id, conn.remote_process)
+            room.connections.pop(conn.id, None)
+            await room.leave(conn)
+        for proc in stale:
+            room.remote_seen.pop(proc, None)
 
     def load_room(self, lounge: Lounge) -> Room:
         existing = self.rooms.get(lounge.id)

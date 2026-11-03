@@ -142,7 +142,6 @@ def list_lounges(
     lounges = db.scalars(stmt.limit(50)).all()
     items = []
     for lounge in lounges:
-        room = hub.get_room(lounge.id)
         items.append(
             {
                 "loungeId": lounge.id,
@@ -151,7 +150,7 @@ def list_lounges(
                 "vibeProfile": lounge.vibe_profile,
                 "status": lounge.status,
                 "inviteCode": lounge.invite_code,
-                "participantCount": len(room.participant_ids()) if room else 0,
+                "participantCount": hub.participant_count(lounge.id),
                 "currentTrack": catalog.get(lounge.current_track_id) if lounge.current_track_id else None,
                 "createdAt": iso_utc(lounge.created_at),
             }
@@ -286,9 +285,11 @@ async def update_settings(
 
 
 @router.post("/{lounge_id}/end")
-def end_lounge(
+async def end_lounge(
     lounge_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> dict:
+    from ..cluster import cluster
+
     lounge = get_lounge(db, lounge_id)
     _manager(user, lounge)
     room = get_room(db, lounge)
@@ -298,6 +299,7 @@ def end_lounge(
     room.log_event("loungeEnded", {"by": user.id}, user.id)
     room.flush()
     hub.rooms.pop(lounge.id, None)
+    await cluster.release(lounge.id)
     return {"loungeId": lounge.id, "status": "ended"}
 
 

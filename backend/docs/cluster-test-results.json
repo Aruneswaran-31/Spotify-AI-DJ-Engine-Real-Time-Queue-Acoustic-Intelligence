@@ -1,0 +1,54 @@
+{
+  "workers": {
+    "a": {
+      "status": "ok",
+      "uptimeSeconds": 8.2,
+      "worker": "Aruneswaran:15676:0da0a4",
+      "bus": "sqlite",
+      "rooms": 0,
+      "tracks": 16,
+      "llm": "deterministic fallback"
+    },
+    "b": {
+      "status": "ok",
+      "uptimeSeconds": 8.2,
+      "worker": "Aruneswaran:8268:b140b8",
+      "bus": "sqlite",
+      "rooms": 0,
+      "tracks": 16,
+      "llm": "deterministic fallback"
+    }
+  },
+  "loungeId": "lg_5b80a670a9dd",
+  "participants": 3,
+  "crossWorkerCommandMs": 32.28,
+  "queueOrderA": [
+    "qe_a9fa51a7c8fd",
+    "qe_0c5184afd0c6",
+    "qe_b4bdcf71b751"
+  ],
+  "queueOrderB": [
+    "qe_a9fa51a7c8fd",
+    "qe_0c5184afd0c6",
+    "qe_b4bdcf71b751"
+  ],
+  "restForwardMs": 50.84,
+  "chatViaEdgeMs": 67.96,
+  "lateJoinOnEdgeMs": 31.53,
+  "checks": {
+    "two_distinct_workers": true,
+    "presence_spans_workers": true,
+    "command_from_edge_worker": true,
+    "event_reaches_other_worker": true,
+    "same_queue_order": true,
+    "rest_forwarded_ok": true,
+    "rest_same_state": true,
+    "chat_post_ok": true,
+    "chat_broadcast_to_owner": true,
+    "edge_permission_error": true,
+    "late_join_state": true,
+    "late_join_sees_queue": true,
+    "end_lounge_ok": true
+  },
+  "allPassed": true
+}
